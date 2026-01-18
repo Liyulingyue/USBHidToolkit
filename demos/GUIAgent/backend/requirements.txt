@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+opencv-python
+numpy
+websockets
+python-dotenv
+httpx
+# 我们的 USBHidToolkit 包
+git+https://github.com/Liyulingyue/USBHidToolkit.git
