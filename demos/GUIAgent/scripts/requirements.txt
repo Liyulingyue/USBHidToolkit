@@ -1,0 +1,4 @@
+flask
+mss
+numpy
+opencv-python
