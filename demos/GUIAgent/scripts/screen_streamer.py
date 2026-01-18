@@ -18,8 +18,8 @@ def generate_frames():
         while True:
             start_time = time.time()
             
-            # 截取屏幕
-            img = np.array(sct.grab(monitor))
+            # 截取屏幕，包含鼠标光标
+            img = np.array(sct.grab(monitor, include_cursor=True))
             
             # mss 抓取的是 BGRA，转换为 BGR 供 OpenCV 使用
             frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
