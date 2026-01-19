@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+transformers>=4.45.0
+torch
+torchvision
+accelerate
+pillow
+qwen-vl-utils
+python-multipart
+numpy

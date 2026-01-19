@@ -25,7 +25,17 @@ CAMERA_SOURCE = os.getenv("CAMERA_SOURCE", "0")
 if CAMERA_SOURCE.isdigit():
     CAMERA_SOURCE = int(CAMERA_SOURCE)
 
-camera = CameraService(camera_source=CAMERA_SOURCE)
+# 分辨率配置：支持 1080p, 720p 等挡位或手动指定
+CAMERA_RES = os.getenv("CAMERA_RESOLUTION", "720p").lower()
+res_map = {
+    "1080p": (1920, 1080),
+    "720p": (1280, 720),
+    "480p": (640, 480)
+}
+
+width, height = res_map.get(CAMERA_RES, (1280, 720))
+
+camera = CameraService(camera_source=CAMERA_SOURCE, width=width, height=height)
 gui_agent = GUIAgent(camera)
 
 @app.on_event("startup")

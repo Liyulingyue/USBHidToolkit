@@ -5,6 +5,7 @@ import httpx
 import json
 import asyncio
 import re
+import ast
 from dotenv import load_dotenv
 from .camera import CameraService
 from .hid import hid_service
@@ -14,222 +15,231 @@ load_dotenv()
 class GUIAgent:
     def __init__(self, camera: CameraService):
         self.camera = camera
+        
+        # 基础配置 (用于单模型模式)
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o")
+        
+        # 布局感知模型 (Layout model, e.g. ShowUI)
+        self.layout_base_url = os.getenv("LAYOUT_BASE_URL")
+        self.layout_api_key = os.getenv("LAYOUT_API_KEY")
+        self.layout_model = os.getenv("LAYOUT_MODEL")
+        
+        # 决策推理模型 (Reasoner model, e.g. Ernie, GPT-4o)
+        self.reasoner_base_url = os.getenv("REASONER_BASE_URL")
+        self.reasoner_api_key = os.getenv("REASONER_API_KEY")
+        self.reasoner_model = os.getenv("REASONER_MODEL")
+        
         self.history = [] # 记录最近几次的动作与思考，实现闭环反思
         self.is_running = False
 
     async def think_and_act(self, user_goal: str):
         self.is_running = True
-        
-        # 1. 采集当前画面
-        frame = self.camera.get_frame()
-        if frame is None:
-            return {"error": "No camera frame available"}
+        try:
+            # 1. 采集当前画面
+            frame = self.camera.get_frame()
+            if frame is None:
+                return {"error": "No camera frame available"}
 
-        # 2. 编码图片
-        _, buffer = cv2.imencode('.jpg', frame)
-        base64_image = base64.b64encode(buffer).decode('utf-8')
+            # 2. 编码图片
+            _, buffer = cv2.imencode('.jpg', frame)
+            base64_image = base64.b64encode(buffer).decode('utf-8')
 
-        # 3. 构造带历史信息的 Prompt
-        history_text = ""
-        if self.history:
-            history_text = "\n最近动作记录：\n" + "\n".join([
-                f"- 动作: {h['action']}, 位移: {h.get('params',{}).get('dx')},{h.get('params',{}).get('dy')}, 思考: {h['thought'][:50]}..."
-                for h in self.history[-3:] # 提供最近3步作为参考
-            ])
+            # 3. 构造历史信息
+            history_text = ""
+            if self.history:
+                history_text = "\n最近动作记录：\n" + "\n".join([
+                    f"- 动作: {h.get('action')}, 思考: {h.get('thought','')[:50]}..."
+                    for h in self.history[-3:]
+                ])
 
-        prompt = f"""
-你是一个专业的视觉控制智能体。你通过摄像头观察物理主机的屏幕画面，并控制一套额外的 HID 键鼠设备。
+            raw_content = ""
+            
+            # 判断是否进入混合模式 (Hybrid Mode)
+            if self.layout_model and self.reasoner_model:
+                print(f"\n[Agent] 进入混合模式: Layout({self.layout_model}) + Reasoner({self.reasoner_model})")
+                
+                # --- 第一阶段: 规划 (Planning) ---
+                # 推理模型先理解任务，确定需要交互的元素或位置
+                plan_prompt = f"""你是一个 GUI 操作规划器。基于用户目标和屏幕画面，分析需要的具体操作步骤。
+
 用户目标："{user_goal}"
 {history_text}
 
-【操作规范】：
-由于物理移动可能存在比例误差，请采用“观察-决策-反思”闭环模式：
-1. **现状识别**：当前鼠标指针在画面的坐标（大致位置）？目标元素在哪里？
-2. **坐标系说明**：
-   - 屏幕左上角是坐标原点 (0,0)
-   - dx > 0 表示向右移动，dx < 0 表示向左移动
-   - dy > 0 表示向下移动，dy < 0 表示向上移动
-   - 关闭按钮通常在屏幕右上角，需要 dx > 0, dy < 0 的组合移动
-3. **误差对比**：如果之前有过移动，对比上图，鼠标是否精准到达了你预期的位置？
-4. **视觉验证**：执行点击后，必须观察屏幕是否有预期变化（如窗口关闭、页面变化），如果没有变化则需要重新定位。**只有当你确信看到目标结果时，才使用 "finish"**。
-5. **小步快跑**：单次移动不要超过 200 像素，避免超出屏幕边界。
+请分析并返回 ```json``` 代码块，包括：
+1. 需要定位的目标UI元素（与任务相关）
+2. 参考元素（如当前鼠标指针位置，用于计算相对位移）
 
-请务必回复一个 ```json ``` 代码块：
+格式如下：
 ```json
 [
     {{
-        "thought": "你的详细反思：观察到了什么 -> 之前动作是否有偏差 -> 本次计划如何修正（明确dx/dy的方向和意义）",
-        "action": "move" | "click" | "type" | "wait" | "finish",
-        "params": {{
-            "dx": 整数 (x轴像素位移，正右负左，建议-200到200之间),
-            "dy": 整数 (y轴像素位移，正下负上，建议-200到200之间),
-            "button": "left" | "right",
-            "text": "要输入的文本"
-        }}
+        "target_element": "目标UI元素的名称（如'关闭按钮'、'搜索框'）",
+        "description": "这个元素的特征描述（如'通常位于窗口右上角，呈现为X图标'）",
+        "action": "CLICK|INPUT|ENTER|SCROLL|etc",
+        "is_reference": false
+    }},
+    {{
+        "target_element": "鼠标指针",
+        "description": "当前屏幕上的鼠标指针位置",
+        "action": "NONE",
+        "is_reference": true
     }}
 ]
 ```
-注意：移动后要观察鼠标位置是否到达预期，点击后要确认是否有视觉反馈。如果只需要一步操作，返回单个对象的数组。
+
+示例：
+```json
+[
+    {{
+        "target_element": "close button",
+        "description": "typically a small X icon at the top-right corner of the window",
+        "action": "CLICK",
+        "is_reference": false
+    }},
+    {{
+        "target_element": "mouse cursor",
+        "description": "the current position of the mouse pointer on the screen",
+        "action": "NONE",
+        "is_reference": true
+    }}
+]
+```
+
+注意：必须包括鼠标指针位置，这样执行阶段才能精确计算相对位移。
 """
+                async with httpx.AsyncClient() as client:
+                    plan_payload = {
+                        "model": self.reasoner_model,
+                        "messages": [{"role": "user", "content": plan_prompt}]
+                    }
+                    headers = {"Authorization": f"Bearer {self.reasoner_api_key or self.api_key}", "Content-Type": "application/json"}
+                    plan_resp = await client.post(f"{self.reasoner_base_url or self.base_url}/chat/completions", 
+                                                  headers=headers,
+                                                  json=plan_payload, timeout=60.0)
+                    plan_text = plan_resp.json()['choices'][0]['message']['content'] if plan_resp.status_code == 200 else ""
+                    print(f"[Agent] 规划步骤:\n{plan_text}")
+                    
+                    # 提取规划中的 JSON
+                    import re
+                    plan_json_match = re.search(r'```json\s*(.*?)\s*```', plan_text, re.DOTALL)
+                    plan_info = plan_json_match.group(1).strip() if plan_json_match else plan_text
 
-        # 4. 请求 VLM
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-                        }
-                    ]
-                }
-            ],
-            # 移除强制 JSON 模式，允许模型自由发挥但通过 Markdown 包裹关键数据
-        }
-
-        try:
-            print(f"\n[Agent] 正在请求 VLM (Model: {self.model})...")
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=60.0
-                )
-                
-                if response.status_code != 200:
-                    print(f"[Agent] API 请求失败！状态码: {response.status_code}")
-                    return {"error": f"API Error {response.status_code}"}
-
-                res_data = response.json()
-                raw_content = res_data['choices'][0]['message']['content']
-                print(f"[Agent] 模型原始回复: \n{raw_content}")
-
-                # 解析内容：提取 ```json ... ``` 之间的内容
+                # --- 第二阶段: 定位 (Grounding with ShowUI) ---
+                # 为每个规划中的元素定位坐标
+                locations = {}
                 try:
-                    json_match = re.search(r'```json\s*(.*?)\s*```', raw_content, re.DOTALL)
-                    if json_match:
-                        content = json_match.group(1).strip()
-                    else:
-                        # 兜底：尝试寻找第一个 { 和最后一个 }
-                        content_match = re.search(r'(\{.*\})', raw_content, re.DOTALL)
-                        content = content_match.group(1) if content_match else raw_content
-                    
-                    print(f"[Agent] 提取的 JSON 内容: {content}")
-                    
-                    # 处理多种可能的格式
-                    if content.startswith('[') and content.endswith(']'):
-                        # 已经是数组格式
-                        decision_data = json.loads(content)
-                    elif '},{' in content or '}\s*,?\s*{' in content:
-                        # 多个对象用逗号分隔，包装成数组
-                        content = re.sub(r'}\s*,?\s*{', '},{', content)
-                        if not content.startswith('['):
-                            content = f"[{content}]"
-                        print(f"[Agent] 修复后的数组格式: {content}")
-                        decision_data = json.loads(content)
-                    else:
-                        # 单个对象
-                        decision_data = json.loads(content)
-                        if isinstance(decision_data, dict):
-                            decision_data = [decision_data]
-                    
-                    decisions = decision_data if isinstance(decision_data, list) else [decision_data]
-                except Exception as parse_err:
-                    print(f"[Agent] 解析失败! Content: {raw_content}")
-                    return {"error": "Parse error"}
-
-                last_decision = {"status": "processing"}
-                for decision in decisions:
-                    print(f"[Agent] 思考: {decision.get('thought')}")
-                    print(f"[Agent] 执行: {decision.get('action')} {decision.get('params')}")
-                    
-                    if decision.get('action') == 'finish':
-                        # 在宣布完成前，进行最终的视觉验证
-                        print("[Agent] 模型认为任务完成，进行最终视觉验证...")
-                        await asyncio.sleep(1.0)  # 等待系统响应
+                    plan_list = json.loads(plan_info)
+                except:
+                    plan_list = []
+                
+                if isinstance(plan_list, list):
+                    for element in plan_list:
+                        if not isinstance(element, dict):
+                            continue
+                        target_name = element.get("target_element", "")
+                        description = element.get("description", "")
                         
-                        verification_frame = self.camera.get_frame()
-                        if verification_frame is not None:
-                            _, verification_buffer = cv2.imencode('.jpg', verification_frame)
-                            verification_base64 = base64.b64encode(verification_buffer).decode('utf-8')
-                            
-                            verification_prompt = f"""
-请验证任务"{user_goal}"是否真的完成了。观察当前屏幕：
-- 如果浏览器确实关闭了，返回 "verified": true
-- 如果浏览器还在，返回 "verified": false
+                        # 为每个元素单独调用 ShowUI
+                        query = f"Find: {target_name}\nDescription: {description}"
+                        element_location = await self._get_layout_info(base64_image, query)
+                        locations[target_name] = element_location
+                        print(f"[Agent] 定位 '{target_name}': {element_location}")
+                
+                layout_info = json.dumps(locations, ensure_ascii=False)
+                print(f"[Agent] 所有元素定位结果:\n{layout_info}\n" + "-"*30)
 
+                # --- 第三阶段: 执行 (Execution) ---
+                # 推理模型根据规划和坐标，精确计算位移并执行
+                exec_prompt = f"""你是一个 GUI 操作执行器。基于规划、视觉定位结果和屏幕画面，精确计算并执行操作。
+
+用户目标："{user_goal}"
+
+操作规划：
+{plan_info}
+
+视觉定位结果（ShowUI 返回的目标坐标，归一化 0-1）：
+{layout_info}
+
+【坐标系统】：
+- 定位结果中的坐标 [x, y] 是归一化坐标（0-1范围）
+- 屏幕分辨率：1920x1080
+- 转换公式：pixel_x = x * 1920, pixel_y = y * 1080
+
+【执行策略】：
+1. 根据定位结果找到"鼠标指针"的当前位置
+2. 根据定位结果找到目标元素的位置
+3. 精确计算 dx = target_pixel_x - cursor_pixel_x，dy = target_pixel_y - cursor_pixel_y
+4. 如果位移超过 250 像素，分步执行但保持正确方向
+
+返回操作指令，格式为：
+```json
+[
+    {{
+        "thought": "根据鼠标位置 [cursor_x, cursor_y] 和目标位置 [target_x, target_y]，计算位移逻辑",
+        "action": "CLICK" | "INPUT" | "ENTER" | "FINISH",
+        "dx": 像素位移,
+        "dy": 像素位移,
+        "value": "输入内容（仅INPUT需要）"
+    }}
+]
+```
+"""
+                raw_content = await self._get_reasoner_decision(exec_prompt)
+                print(f"[Agent] 执行指令: \n{raw_content}")
+
+            else:
+                # --- 单模型传统模式 (Original Mode) ---
+                print(f"\n[Agent] 正在请求单模型 VLM (Model: {self.model})...")
+                model_str = (self.model or "").lower()
+                is_showui = "showui" in model_str
+                
+                if is_showui:
+                    system_prompt = """You are an AI assistant controlling a real mouse via relative movements (dx, dy).
+You see the current screen image. You need to identify where the mouse cursor IS and where it SHOULD BE.
+
+Action Space:
+1. CLICK: Click the current position. 
+2. INPUT: Type 'value'.
+3. ENTER: Press enter.
+4. FINISH: Task completed.
+
+IMPORTANT: Because our hardware uses RELATIVE movement, you MUST include "dx" and "dy" in pixels.
+MUST return your response in a ```json code block.
+Format your response as:
+```json
+[
+  {'thought': 'current mouse is at [100, 100], target is [200, 300], so dx=100, dy=200', 'action': 'CLICK', 'dx': 100, 'dy': 200}
+]
+```
+"""
+                    prompt = f"{system_prompt}\n\nTask: {user_goal}\n{history_text}"
+                else:
+                    prompt = f"""你是一个智能视觉助手，通过观察屏幕截图来操作电脑。
+你不能直接看到坐标，但你可以通过观察鼠标指针的位置来决定如何移动。
+
+用户目标: "{user_goal}"
 {history_text}
 
+请在```json代码块中返回一个 JSON 列表。每个对象必须包含：
+- thought: 你的思考过程，说明你看到了什么，鼠标在哪，目标在哪。
+- action: 动作类型 ("CLICK", "INPUT", "ENTER", "WAIT", "FINISH")。
+- dx, dy: 鼠标的相对位移像素值（例如：dx: 100 表示向右移动100像素）。
+- value: 如果是 INPUT，请输入字符串内容。
+
+示例格式:
 ```json
-{{
-    "verified": true | false,
-    "reason": "你的判断理由"
-}}
-```"""
+[
+  {{"thought": "我看到任务栏图标在右侧，当前鼠标在中间。我需要向右移动并点击。", "action": "CLICK", "dx": 200, "dy": 0}}
+]
+```
+"""
+                raw_content = await self._get_vlm_response(prompt, base64_image)
+                print(f"[Agent] VLM 原始回复: \n{raw_content}")
 
-                            verification_payload = {
-                                "model": self.model,
-                                "messages": [
-                                    {
-                                        "role": "user",
-                                        "content": [
-                                            {"type": "text", "text": verification_prompt},
-                                            {
-                                                "type": "image_url",
-                                                "image_url": {"url": f"data:image/jpeg;base64,{verification_base64}"}
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-
-                            try:
-                                verification_response = await httpx.AsyncClient().post(
-                                    f"{self.base_url}/chat/completions",
-                                    headers=headers,
-                                    json=verification_payload,
-                                    timeout=20.0
-                                )
-                                
-                                if verification_response.status_code == 200:
-                                    verification_data = verification_response.json()
-                                    verification_content = verification_data['choices'][0]['message']['content']
-                                    
-                                    verification_match = re.search(r'```json\s*(.*?)\s*```', verification_content, re.DOTALL)
-                                    if verification_match:
-                                        verification_result = json.loads(verification_match.group(1))
-                                        if verification_result.get('verified'):
-                                            print("[Agent] 视觉验证确认：任务完成！")
-                                            return {"status": "finished", "thought": decision.get('thought')}
-                                        else:
-                                            print(f"[Agent] 视觉验证失败：{verification_result.get('reason')}，继续执行...")
-                                            # 不返回 finish，继续下一轮思考
-                                            continue
-                            except Exception as e:
-                                print(f"[Agent] 验证失败，继续执行: {e}")
-                        
-                        print("[Agent] 跳过验证，继续执行...")
-                        continue
-                    
-                    await self._execute(decision)
-                    # 将本次动作存入历史记录，供下一轮思考
-                    self.history.append(decision)
-                    last_decision = decision
-                    if len(decisions) > 1: await asyncio.sleep(0.3)
-
-                return last_decision
+            # 4. 解析与执行
+            return await self._parse_and_execute_content(raw_content, user_goal)
 
         except Exception as e:
             print(f"[Agent] 发生未预期错误: {str(e)}")
@@ -239,62 +249,142 @@ class GUIAgent:
         finally:
             self.is_running = False
 
-    async def _execute(self, decision):
-        action = decision.get("action")
-        params = decision.get("params", {})
-
-        print(f"[Agent] 开始执行动作: {action}, 参数: {params}")
+    async def _get_layout_info(self, base64_image, user_goal):
+        """调用 Layout 模型 (ShowUI) 结合用户目标提取 UI 信息
+        参考 ShowUI 官方文档的 UI Grounding 模式
+        """
+        headers = {"Authorization": f"Bearer {self.layout_api_key or self.api_key}", "Content-Type": "application/json"}
         
-        # 检查 HID 服务状态
+        # 使用官方推荐的 UI Grounding System Prompt
+        system_prompt = "Based on the screenshot of the page, I give a text description and you give its corresponding location. The coordinate represents a clickable location [x, y] for an element, which is a relative coordinate on the screenshot, scaled from 0 to 1."
+        
+        payload = {
+            "model": self.layout_model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": system_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                {"type": "text", "text": user_goal}
+            ]}]
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(f"{self.layout_base_url}/chat/completions", headers=headers, json=payload, timeout=60.0)
+                if resp.status_code == 200:
+                    content = resp.json()['choices'][0]['message']['content']
+                    return content
+                return f"Error: {resp.status_code}"
+        except Exception as e:
+            return f"Layout Error: {str(e)}"
+
+    async def _get_reasoner_decision(self, prompt):
+        """调用推理模型做出决策"""
+        headers = {"Authorization": f"Bearer {self.reasoner_api_key or self.api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": self.reasoner_model,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(f"{self.reasoner_base_url or self.base_url}/chat/completions", headers=headers, json=payload, timeout=60.0)
+                if resp.status_code == 200:
+                    return resp.json()['choices'][0]['message']['content']
+                return f"Error: {resp.status_code}"
+        except Exception as e:
+            return f"Reasoner Error: {str(e)}"
+
+    async def _get_vlm_response(self, prompt, base64_image):
+        """单 VLM 模式下的原始请求"""
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+            ]}]
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload, timeout=60.0)
+                if resp.status_code == 200:
+                    return resp.json()['choices'][0]['message']['content']
+                return f"Error: {resp.status_code}"
+        except Exception as e:
+            return f"VLM Error: {str(e)}"
+
+    async def _parse_and_execute_content(self, content, user_goal):
+        try:
+            # 尝试提取代码块
+            json_match = re.search(r'```(?:json|python)?\s*(.*?)\s*```', content, re.DOTALL)
+            clean_content = json_match.group(1).strip() if json_match else content.strip()
+            
+            decisions = []
+            try:
+                parsed = ast.literal_eval(clean_content)
+                if isinstance(parsed, list): decisions = parsed
+                elif isinstance(parsed, tuple): decisions = list(parsed)
+                else: decisions = [parsed]
+            except Exception:
+                # 兜底：寻找多个 {}
+                potential_dicts = re.findall(r'\{[^{}]*\}', clean_content)
+                for d_str in potential_dicts:
+                    try: decisions.append(ast.literal_eval(d_str))
+                    except: continue
+            
+            if not decisions:
+                return {"error": "Could not parse any valid actions"}
+
+            last_result = None
+            for decision in decisions:
+                if not isinstance(decision, dict): continue
+                
+                action = str(decision.get('action', '')).upper()
+                if action == 'FINISH':
+                    return {"status": "finished", "thought": decision.get('thought')}
+                
+                last_result = await self._execute(decision)
+                self.history.append(decision)
+                await asyncio.sleep(0.5)
+            
+            return last_result or {"status": "empty"}
+            
+        except Exception as e:
+            return {"error": f"Parse/Exec Error: {str(e)}"}
+
+    async def _execute(self, decision):
+        action = str(decision.get("action", "")).upper()
+        params = decision.get("params", {})
+        
+        def get_p(key, default=None):
+            return decision.get(key, params.get(key, default))
+
+        print(f"[Agent] 执行动作: {action}")
         if not hid_service.client:
-            print("[Agent] 错误: HID 服务未连接或客户端为空")
-            return False
+            return {"error": "HID not connected"}
 
         try:
-            if action == "move":
-                dx = params.get("dx", 0)
-                dy = params.get("dy", 0)
-                # 强制限制移动距离，避免超出屏幕边界
-                dx = max(-200, min(200, dx))
-                dy = max(-200, min(200, dy))
-                print(f"[Agent] 执行鼠标位移: dx={dx}, dy={dy} (已限制在±200范围内)")
-                result = hid_service.execute_mouse_relative(dx, dy)
-                print(f"[Agent] 鼠标位移执行结果: {result}")
-                
-            elif action == "click":
-                button = params.get("button", "left")
-                print(f"[Agent] 执行鼠标点击: button={button}")
-                result = hid_service.execute_mouse_click(button)
-                print(f"[Agent] 鼠标点击执行结果: {result}")
-                # 点击后等待更长时间，让系统响应
-                await asyncio.sleep(1.0)
-                
-            elif action == "type":
-                text = params.get("text", "")
-                print(f"[Agent] 执行键盘输入: text='{text}'")
-                for char in text:
-                    result = hid_service.execute_keyboard_tap(char)
-                    print(f"[Agent] 键盘敲击 '{char}' 执行结果: {result}")
+            dx = get_p("dx")
+            dy = get_p("dy")
+            if dx is not None or dy is not None:
+                dx, dy = int(dx or 0), int(dy or 0)
+                # 硬件限制通常单次较小，这里做个保护
+                dx, dy = max(-400, min(400, dx)), max(-400, min(400, dy))
+                print(f"[Agent] 执行位移: dx={dx}, dy={dy}")
+                hid_service.execute_mouse_relative(dx, dy)
+                await asyncio.sleep(0.2)
+
+            if action in ["CLICK", "TAP"]:
+                hid_service.execute_mouse_click(get_p("button", "left"))
+                await asyncio.sleep(0.8)
+            elif action in ["TYPE", "INPUT"]:
+                text = get_p("text") or get_p("value", "")
+                for char in str(text):
+                    hid_service.execute_keyboard_tap(char)
                     await asyncio.sleep(0.05)
-                    
-            elif action == "wait":
-                wait_time = params.get("seconds", 0.5)
-                print(f"[Agent] 执行等待: {wait_time} 秒")
-                await asyncio.sleep(wait_time)
-                result = True
-                
-            else:
-                print(f"[Agent] 未知动作类型: {action}")
-                result = False
-                
+            elif action == "ENTER":
+                hid_service.execute_keyboard_tap("\n")
+            elif action == "WAIT":
+                await asyncio.sleep(float(get_p("seconds", 1.0)))
+            
+            return {"status": "success", "action": action}
         except Exception as e:
-            print(f"[Agent] 执行动作时发生异常: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            result = False
-        
-        print(f"[Agent] 动作 '{action}' 执行完成")
-        
-        # 执行动作后的冷却等待，确保下一帧画面能反映变化
-        await asyncio.sleep(0.5)
-        return result
+            return {"error": f"HID execution error: {str(e)}"}

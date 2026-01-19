@@ -1,0 +1,14 @@
+# Ignore ShowUI model weights
+models--showlab--ShowUI-2B/
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Local environment variables
+.env
+.env.local
+
+# Logs
+*.log
