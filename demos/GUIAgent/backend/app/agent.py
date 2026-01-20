@@ -255,8 +255,8 @@ Format your response as:
         """
         headers = {"Authorization": f"Bearer {self.layout_api_key or self.api_key}", "Content-Type": "application/json"}
         
-        # 使用官方推荐的 UI Grounding System Prompt
-        system_prompt = "Based on the screenshot of the page, I give a text description and you give its corresponding location. The coordinate represents a clickable location [x, y] for an element, which is a relative coordinate on the screenshot, scaled from 0 to 1."
+        # 使用更新后的 UI Grounding System Prompt，支持 JSON 格式和 0-1000 归一化
+        system_prompt = "Based on the screenshot of the page, I give a text description and you give its corresponding location. The coordinate represents a clickable location [x, y] or a bounding box [xmin, ymin, xmax, ymax] for an element, which is a relative coordinate on the screenshot, scaled from 0 to 1000. Please respond with JSON format like {\"point\": [x, y]} or {\"bbox_2d\": [xmin, ymin, xmax, ymax]}."
         
         payload = {
             "model": self.layout_model,
